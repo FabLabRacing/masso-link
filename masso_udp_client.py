@@ -550,24 +550,20 @@ class MassoClient:
                         decoded_msgs = []
                         
                         # Check for meaningful changes first
-                        state_changed = data[5] != self.last_status[5]
-                        file_state_changed = data[6] != self.last_status[6]
+                        progress_changed = data[5] != self.last_status[5]
+                        run_active_changed = data[6] != self.last_status[6]
                         line_changed = data[13] != self.last_status[13]
                         # Check full filename range (17-80) for changes
                         filename_changed = data[17:80] != self.last_status[17:80]
                         
-                        # Decode State
-                        if state_changed:
-                            state_desc = {
-                                0x00: "Idle", 0x40: "Ready", 0x41: "Starting",
-                                0x51: "Running", 0x5a: "Running", 0x62: "Finishing", 0x64: "Complete"
-                            }.get(data[5], "Unknown")
-                            decoded_msgs.append(f"State: {state_desc} (0x{data[5]:02x})")
+                        # Decode Progress
+                        if progress_changed:
+                            decoded_msgs.append(f"Progress: {data[5]}%")
 
-                        # Decode File State
-                        if file_state_changed:
-                            fs_desc = {0x00: "Executing", 0x02: "Loaded"}.get(data[6], "Unknown")
-                            decoded_msgs.append(f"File State: {fs_desc} (0x{data[6]:02x})")
+                        # Decode Execution State
+                        if run_active_changed:
+                            run_state = "Running" if data[6] == 0x02 else "Not Running"
+                            decoded_msgs.append(f"Execution: {run_state} (0x{data[6]:02x})")
                         
                         # Decode Filename
                         if filename_changed:
@@ -586,9 +582,26 @@ class MassoClient:
                         if line_changed:
                             decoded_msgs.append(f"Line: {data[13]}")
 
+                        # Decode Byte 12 (User Prompt / Tool Change State)
+                        if data[12] != self.last_status[12]:
+                            if data[12] == 0x00:
+                                decoded_msgs.append("Waiting for tool change")
+                            elif data[12] == 0x01:
+                                decoded_msgs.append("User Input Completed/Resumed")
+                            else:
+                                decoded_msgs.append(f"User Prompt State: 0x{data[12]:02x}")
+
+                        # Investigate Bytes 14-16 (always 0x00 in captures - log if they ever change)
+                        if data[14:17] != self.last_status[14:17]:
+                            b14 = f"0x{data[14]:02x}"
+                            b15 = f"0x{data[15]:02x}"
+                            b16 = f"0x{data[16]:02x}"
+                            decoded_msgs.append(f"[Inv] Bytes 14-16 changed: [{b14},{b15},{b16}] (expected 0x00)")
+
                         # Check for other (unknown) changes
-                        # Ignored bytes: 0-1 (checksum), 5 (state), 6 (file state), 8-11 (job count), 13 (line), 17-80 (filename)
-                        ignored_indices = {0, 1, 5, 6, 13} | set(range(8, 12)) | set(range(17, 81))
+                        # Ignored: 0-1 (checksum), 5 (progress), 6 (exec state), 7 (0xFF constant),
+                        #          8-11 (job count), 12 (user prompt), 13 (line), 14-16 (const 0x00), 17-80 (filename)
+                        ignored_indices = {0, 1, 5, 6, 7, 12, 13, 14, 15, 16} | set(range(8, 12)) | set(range(17, 81))
                         
                         for i in range(len(data)):
                             if data[i] != self.last_status[i]:
@@ -618,10 +631,9 @@ class MassoClient:
                     # Track feed hold state (line stalled while running)
                     line_value = data[13]
                     line_changed = self._last_line_value is None or line_value != self._last_line_value
-                    state_running = data[5] in (0x51, 0x5a)
-                    executing = data[6] == 0x00
+                    state_running = data[6] == 0x02
 
-                    if not (state_running and executing):
+                    if not state_running:
                         if self._in_feed_hold and self.monitor_mode:
                             print("[Status] Feed Hold released")
                             self._log("Feed Hold released")
@@ -925,8 +937,8 @@ class MassoClient:
         data = self.last_status
         
         # Decode known fields
-        state_flags_1 = data[5]
-        state_flags_2 = data[6]
+        progress_val = data[5]
+        run_active_flag = data[6]
         job_count = int.from_bytes(data[8:12], byteorder='little')
         line_number = data[13]
         
@@ -937,25 +949,12 @@ class MassoClient:
         else:
             filename = filename_bytes.decode('ascii', errors='ignore').strip()
         
-        # Decode state flags
-        state_desc = {
-            0x00: "Idle",
-            0x40: "Ready",
-            0x41: "Starting",
-            0x51: "Running",
-            0x5a: "Running",
-            0x62: "Finishing",
-            0x64: "Complete"
-        }.get(state_flags_1, "Unknown")
-        
-        file_state = {
-            0x00: "Executing",
-            0x02: "Loaded"
-        }.get(state_flags_2, "Unknown")
+        # Decode state
+        run_state = "Running" if run_active_flag == 0x02 else "Not Running"
         
         print("\n=== Machine Status ===")
-        print(f"State: {state_desc} (0x{state_flags_1:02x})")
-        print(f"File State: {file_state} (0x{state_flags_2:02x})")
+        print(f"Progress: {progress_val}%")
+        print(f"Execution: {run_state} (0x{run_active_flag:02x})")
         print(f"Job Count: {job_count}")
         print(f"Current File: {filename if filename else '(none)'}")
         print(f"Line Number: {line_number}")
@@ -1094,7 +1093,7 @@ def interactive_mode(host, debug=False):
         print("    - Wrong IP address or controller is offline")
         print("[*] Try the 'status' command to check manually")
     
-    print("\nCommands: status, tools, monitor, log, upload <file>, watch <dir>, watchoff, clearwatch <dir>, send <hex>, connect [IP], quit")
+    print("\nCommands: status, tools, monitor, log, upload <file>, watch <dir>, watchoff, clearwatch <dir>, send <hex>, connect [IP], handshake, subscribe, quit")
     
     try:
         while True:

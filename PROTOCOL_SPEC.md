@@ -35,9 +35,6 @@ This document describes the MASSO controller UDP protocol as implemented in `mas
   - Magic: `0x03 0x00`
   - Type: `0x03`
   - Serial Number: 2 bytes (little-endian)
-  - Padding: 3 bytes `0x00 0x00 0x00` = 12345 decimal
-  - **Structure**: `[Unknown 4 bytes][Type 1 byte][Unknown 1 byte][Serial 2 bytes][Reserved 2 bytes]`
-
 ### Keepalive/Status Request (Type 0x01)
 - **Request**: 8 bytes payload
   - Magic: `0x03 0x00`
@@ -118,31 +115,33 @@ print(f"Controller Serial: {serial}")
 ## Status Packet Structure (270 bytes)
 
 > [!NOTE]
-> The following field mappings are speculative and still being discovered through reverse engineering and observation of packet changes during machine operation.
+> The following field mappings have been reverse-engineered. Recent tests on newer firmware (v5.10) reveal the true purpose of several bytes.
 
 Key fields:
-- Byte 5: State flags
-  - 0x00: Idle
-  - 0x40: Ready
-  - 0x41: Starting
-  - 0x51: Running
-  - 0x5a: Running
-  - 0x62: Finishing
-  - 0x64: Complete
-- Byte 6: File state
-  - 0x00: Executing
-  - 0x02: Loaded
+- Byte 5: Job Progress Percentage
+  - Decimal value from `0` to `100` (e.g., `0x64` = `100%`)
+  - Increments steadily during execution
+  - Remains at the last value if execution is interrupted
+- Byte 6: Execution Active Flag
+  - `0x00`: Not Running (Idle, Feed Hold, or E-Stop)
+  - `0x02`: Actively Running
+  - **Note**: Internal operations like Homing or Probing often appear as "Running" and may execute internal macros.
+- Byte 7: Always `0xFF` — fixed delimiter/padding, does not change
 - Bytes 8-11: Job count (little-endian)
-- Byte 13: Line number
+- Byte 12: User Prompt Waiting Flag (Tool Change, M0, M1, etc.)
+  - `0x01`: Normal operation
+  - `0x00`: Machine paused, waiting for user input (e.g., manual tool change) and Cycle Start
+- Byte 13: Line number (0–255, single byte)
+  - **Note**: During Homing, this typically increments as MASSO runs its internal homing macro.
+- Bytes 14–16: Always `0x00` — reserved/unused in observed captures
 - Bytes 17-80: Filename (null-terminated, up to 63 bytes)
+- Bytes 81-269: Unused/Padded with `0x00` during normal operation
 
 ## Feed Hold Detection
-
-The client detects feed hold when:
-1. Machine state is Running (0x51 or 0x5a)
-2. File state is Executing (0x00)
-3. Line number hasn't changed for 1.5 seconds or more
-4. Line number is greater than 0
+Because Feed Hold and E-Stop states simply set Byte 6 to `0x00` while Byte 5 freezes at its current progress percentage, these bytes alone cannot distinguish the exact stop reason. The client infers a feed hold state when:
+1. The Execution Active Flag is Running (`0x02`)
+2. The Line Number hasn't changed for 1.5 seconds or more
+3. The Line Number is greater than 0
 
 ## Checksum Calculation
 
