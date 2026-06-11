@@ -44,3 +44,8 @@ test_upload_file/
 .masso_watch_state.json
 test.nc
 PROTOCOL_EXPERIMENTS.md
+
+# Local test artifacts
+Captures/
+TestFiles/
+*.pcapng
