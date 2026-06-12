@@ -2,7 +2,7 @@
 
 **⚠️ WORK IN PROGRESS - INCOMPLETE DOCUMENTATION**
 
-**Note**: This protocol specification is based on reverse engineering, packet captures, and controller testing. Many packet fields and status bytes are still not fully understood. Treat this as a working document, not official MASSO documentation.
+**Note**: This protocol specification is based on reverse engineering, packet captures, and controller testing. It includes confirmed SendToMasso V1.7.4 upload behavior. Many packet fields and status bytes are still not fully understood. Treat this as a working document, not official MASSO documentation.
 
 ---
 
@@ -376,11 +376,19 @@ For a final chunk shorter than 1422 bytes:
 ```text
 chunk_length = actual remaining byte count
 data = actual remaining bytes
-trailing pad = 4 bytes
-total length = 17 + remaining_bytes
+trailing pad = 3 bytes if the final chunk length is even
+trailing pad = 4 bytes if the final chunk length is odd
 ```
 
-Because:
+The goal appears to be that the total UDP payload length is always even.
+
+Packet length formula:
+
+```text
+13-byte header + final_chunk_length + trailer
+```
+
+Where the 13-byte data packet header is:
 
 ```text
 2 checksum
@@ -388,28 +396,38 @@ Because:
 1 type
 4 chunk index
 4 chunk length
-N data
-4 final trailing bytes
-= 17 + N
+= 13 bytes
 ```
 
-Example confirmed successful upload:
+Working rule:
+
+```python
+trailer = 3 if final_chunk_length % 2 == 0 else 4
+```
+
+Confirmed examples:
 
 ```text
 File size: 49,369 bytes
 Full chunks: 34
 Final chunk index: 34
-Final chunk length: 1021
-Final UDP payload length: 1038
+Final chunk length: 1021  # odd
+Trailer: 4 bytes
+Final UDP payload length: 13 + 1021 + 4 = 1038
+Result: upload accepted
 ```
-
-Calculation:
 
 ```text
-17 + 1021 = 1038
+File size: 60,630 bytes
+Full chunks: 42
+Final chunk index: 42
+Final chunk length: 906  # even
+Trailer: 3 bytes
+Final UDP payload length: 13 + 906 + 3 = 922
+Result: upload accepted
 ```
 
-A previous failed implementation used only 3 trailing bytes on the final short chunk; MASSO did not ACK that final chunk. Adding the 4th trailing byte made the upload succeed.
+Failed tests showed that using the wrong trailer length on the final short chunk causes MASSO to ignore the final packet and not send the final data ACK.
 
 ### Data Chunk Response
 
@@ -464,7 +482,8 @@ Recommended process:
 8. Send final short chunk:
    - chunk length field = actual remaining bytes
    - actual remaining bytes of data
-   - 4 trailing pad bytes
+   - 3 trailing pad bytes if the final chunk length is even
+   - 4 trailing pad bytes if the final chunk length is odd
 9. Wait for type `0x0B` ACK after each chunk.
 10. Confirm ACK advances to the next expected chunk number.
 
@@ -554,6 +573,31 @@ def calculate_checksum(data: bytes) -> bytes:
 | `0x0B` | next chunk | Data chunk accepted, next expected chunk |
 
 ---
+
+## Confirmed Chunk Boundary Tests
+
+The following file sizes were tested successfully with SendToMasso after the final-chunk trailer rule was corrected:
+
+| File Size | Chunk Pattern | Final Remainder | Result |
+|---:|---|---:|---|
+| 1,421 bytes | one short final chunk | 1,421 | accepted |
+| 1,422 bytes | exactly one full chunk | 0 | accepted |
+| 1,423 bytes | one full chunk + one short final chunk | 1 | accepted |
+| 2,844 bytes | exactly two full chunks | 0 | accepted |
+| 2,845 bytes | two full chunks + one short final chunk | 1 | accepted |
+
+This confirms handling for:
+
+```text
+- files smaller than one full chunk
+- files exactly one full chunk
+- files just over one full chunk
+- files exactly multiple full chunks
+- files just over multiple full chunks
+- odd final remainders
+- even final remainders
+```
+
 
 ## Open Questions
 
