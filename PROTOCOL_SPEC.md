@@ -2,7 +2,7 @@
 
 **⚠️ WORK IN PROGRESS - INCOMPLETE DOCUMENTATION**
 
-**Note**: This protocol specification is based on reverse engineering, packet captures, and controller testing. It includes confirmed SendToMasso V1.7.4 upload behavior. Many packet fields and status bytes are still not fully understood. Treat this as a working document, not official MASSO documentation.
+**Note**: This protocol specification is based on reverse engineering, packet captures, and controller testing. It includes confirmed SendToMasso V1.7.10 upload behavior, including final-chunk padding, folder-aware uploads, nested folders, and the fresh-TX-socket upload-session workaround. Many packet fields and status bytes are still not fully understood. Treat this as a working document, not official MASSO documentation.
 
 ---
 
@@ -14,9 +14,10 @@ This document describes the observed MASSO controller UDP protocol used by MASSO
 - **Controller IP**: User-specified
 - **Controller Port**: UDP `65535`
 - **Client Ports**: UDP `11000-11050`
-  - MASSO documentation identifies these as client bind/send ports.
-  - Some MASSO Link captures show commands/uploads sent from an ephemeral Windows source port while status/ACK traffic returns to client port `11000`.
-  - For third-party clients, binding to the documented `11000-11050` range is recommended unless further testing proves otherwise.
+  - MASSO documentation identifies these as client ports.
+  - Observed MASSO Link behavior commonly uses UDP `11000` for status/ACK receive traffic while commands/uploads may be sent from an ephemeral Windows source port.
+  - SendToMasso V1.7.10 uses a bound RX/status socket in the documented `11000-11050` range and a separate ephemeral TX/upload socket.
+  - Recreating the TX/upload socket before each file upload was required for reliable repeated uploads in testing. Reusing the same TX source port could allow the first upload after connect to succeed, then cause later start-upload attempts to fail until reconnect.
 - **Packet Structure**:
 
 ```text
@@ -284,25 +285,46 @@ MASSO Link captures showed a longer folder-aware start-upload packet.
 Observed total packet lengths include:
 
 ```text
-38 bytes
-50 bytes
+38 bytes total  -> 36-byte payload after CRC
+50 bytes total  -> 48-byte payload after CRC
+62 bytes total  -> 60-byte payload after CRC
 ```
 
-This format carries folder path and filename separately and supports paths such as:
+All observed MASSO Link folder-aware start-upload payload lengths after the 2-byte CRC were divisible by 4. SendToMasso V1.7.10 uses the same practical rule: build the compact folder-aware payload and zero-pad only to the next 4-byte payload boundary.
+
+Observed / working structure:
 
 ```text
-\Test\
+[CRC16]
+[03 00]
+[0A]
+[file_size 4 LE]
+[00 00]
+[folder_length 1]
+[folder path bytes]
+[00]
+[filename bytes]
+[00]
+[pad bytes to 4-byte payload boundary]
 ```
 
-and filenames longer than the original assumed 15-character limit.
+Notes:
 
-Known-good observed filename:
+- `folder_length` appears to be the byte length of the normalized folder path string, including backslash separators, but not including the following NUL byte.
+- Folder paths are backslash-delimited and normalized with leading/trailing backslashes, for example `\`, `\Test\`, or `\aaa\bbbb\`.
+- The bytes after the filename NUL in MASSO Link captures sometimes looked like printable residue such as `38 34 20` (`84 `). Testing indicates the important property is likely the 4-byte payload alignment, not the literal pad byte values. Zero padding worked in SendToMasso V1.7.10.
+- This format supports filenames and folders longer than the original assumed 15-character limit.
+
+Known-good observed / tested targets include:
 
 ```text
-18_Inch__CLAD.nc
+\Test\18_Inch__CLAD.nc
+\a\Clean_flag_with_longer_nameasaaaaaaaaa.tap
+\aaabbbb\Clean_flag_with_longer_nameasaaaaaabbb.tap
+\aaa\bbbb\Clean_flag_with_longer_nameasaaaaaabbb.tap
 ```
 
-This is 16 characters including `.nc`, so the 15-character limit is not universal.
+The last target confirms nested folders work with the folder-aware start-upload format.
 
 ### Start Upload Response
 
@@ -472,20 +494,24 @@ Recommended process:
 1. Connect to controller.
 2. Confirm status packets are being received.
 3. Do not upload while machine is running or faulted.
-4. Send start-upload packet with folder/path, filename, and file size.
-5. Wait for type `0x0A` ACK.
-6. Confirm ACK status bytes are `00 00`.
-7. Send full data chunks:
+4. Create or refresh the TX/upload socket before the upload.
+   - In SendToMasso V1.7.10, the RX/status socket remains bound and connected for status monitoring.
+   - The TX/upload socket is closed/recreated before each upload so the upload starts from a fresh ephemeral UDP source port.
+   - Testing showed first upload after connect could succeed, then repeated uploads from the same TX session/source port could fail until reconnect. Refreshing TX per upload fixed repeated long-name uploads and also appeared to reduce retry delays.
+5. Send start-upload packet with folder/path, filename, and file size.
+6. Wait for type `0x0A` ACK.
+7. Confirm ACK status bytes are `00 00`.
+8. Send full data chunks:
    - chunk length field = `1422`
    - 1422 data bytes
    - 3 trailing pad bytes
-8. Send final short chunk:
+9. Send final short chunk:
    - chunk length field = actual remaining bytes
    - actual remaining bytes of data
    - 3 trailing pad bytes if the final chunk length is even
    - 4 trailing pad bytes if the final chunk length is odd
-9. Wait for type `0x0B` ACK after each chunk.
-10. Confirm ACK advances to the next expected chunk number.
+10. Wait for type `0x0B` ACK after each chunk.
+11. Confirm ACK advances to the next expected chunk number.
 
 ---
 
@@ -494,9 +520,28 @@ Recommended process:
 - ASCII filenames are used in observed captures.
 - Backslash `\` is used as the path separator.
 - Forward slash `/` should not be used.
-- Directories must already exist on MASSO; no folder-create packet has been decoded.
 - The earlier 15-character filename limit applies only to the short fixed-size start-upload format and should not be treated as universal.
-- The folder-aware format supports longer filenames and separate target folders.
+- The folder-aware format supports longer filenames, separate target folders, and nested folders.
+- Missing remote folders appear to be created automatically by MASSO during upload. No separate folder-create packet has been decoded; this appears to be a side effect of the folder-aware start-upload/upload process.
+- Uploading to an existing target filename overwrites the existing file, matching MASSO Link behavior.
+- Backslash separators do not appear to behave like counted filename characters from a user-limit perspective. They are path separators.
+- Confirmed working nested target:
+
+```text
+\aaa\bbbb\Clean_flag_with_longer_nameasaaaaaabbb.tap
+```
+
+This target is 51 characters as displayed including backslashes, and 48 characters if backslashes are ignored.
+
+Practical UI guidance:
+
+```text
+- Show the full MASSO target preview.
+- Show an informational target/name character count excluding backslashes.
+- Warn around 48-50 counted characters if desired.
+- Do not hard-code a 39-character block; later MASSO Link and SendToMasso testing exceeded that.
+- The true maximum path/name limit is still unknown.
+```
 
 ---
 
@@ -547,6 +592,7 @@ def calculate_checksum(data: bytes) -> bytes:
 - The UI should disable uploads when the machine is running, faulted, or recently stopped.
 - A stopped debounce of about 1.5 seconds is recommended.
 - Store last successful upload time locally if showing “file sent X seconds ago”; this appears to be a UI-side MASSO Link feature, not a decoded controller timestamp.
+- For reliable repeated uploads, refresh the TX/upload socket before each upload while keeping the RX/status socket alive.
 
 ---
 
@@ -603,10 +649,11 @@ This confirms handling for:
 
 - Complete mapping of byte 7 fault/status codes.
 - Feed hold: inferred from stalled line number or represented by a dedicated byte?
-- Exact folder-aware start-upload packet structure.
+- Remaining unknown folder-aware start-upload fields/semantics, especially whether pad bytes have any meaning beyond alignment.
 - Whether MASSO officially expects client TX to be bound to `11000-11050`, or whether MASSO Link's ephemeral TX source port is valid/intentional.
+- Why repeated uploads from the same TX/upload source port can fail until reconnect, and whether this is controller session state, stale ACK handling, or another timeout/state-machine behavior.
 - Whether the discovery packet final byte is always the current month.
-- Maximum confirmed filename/path lengths for folder-aware upload.
+- True maximum filename/path lengths for folder-aware upload.
 - Whether remote directory listing, delete, rename, or browse packets exist.
 
 ---
